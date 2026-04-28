@@ -16,4 +16,6 @@ COPY event_card_generator.py .
 EXPOSE 5000
 
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-  CMD python -c "import requests; requests.get('http://localhost:5000/health').raise_for_status()"
+  CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:5000/health')"
+
+CMD ["gunicorn", "--bind", "0.0.0.0:5000", "-k", "gevent", "-w", "2", "api_server:app"]

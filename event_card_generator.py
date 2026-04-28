@@ -1,9 +1,11 @@
 import http.client
+import ast
 import json
 import os
 import random
 import re
 import ssl
+import logging
 from collections import deque
 from typing import Dict, List, Any
 from urllib.parse import urlparse
@@ -11,11 +13,16 @@ from urllib.parse import urlparse
 from dotenv import load_dotenv
 
 load_dotenv()
+logger = logging.getLogger("event_card_generator")
+
+
+class CardGenerationError(Exception):
+    pass
 
 
 class DeepSeekLLMGenerator:
 
-    def __init__(self, model: str = "deepseek-chat"):
+    def __init__(self, model: str = "deepseek-v4-flash"):
         api_key = os.getenv("DEEPSEEK_API_KEY")
         if not api_key:
             raise RuntimeError("DEEPSEEK_API_KEY is not set in .env")
@@ -23,6 +30,13 @@ class DeepSeekLLMGenerator:
         self.api_key = api_key
         self.model = model
         self.base_url = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com").rstrip("/")
+        self.thinking_type = os.getenv("DEEPSEEK_THINKING_TYPE", "disabled").strip().lower()
+        if self.thinking_type not in {"disabled", "enabled"}:
+            logger.warning(
+                "Unsupported DEEPSEEK_THINKING_TYPE=%r, falling back to 'disabled'",
+                self.thinking_type,
+            )
+            self.thinking_type = "disabled"
 
         parsed = urlparse(self.base_url)
         self._host = parsed.hostname
@@ -43,17 +57,29 @@ class DeepSeekLLMGenerator:
                 self._conn = None
         if self._conn is None:
             self._conn = http.client.HTTPSConnection(
-                self._host, self._port, context=self._ssl_ctx, timeout=30
+                self._host, self._port, context=self._ssl_ctx, timeout=60
             )
         return self._conn
 
-    def _call_api(self, messages: List[Dict[str, str]], max_tokens: int, temperature: float) -> str:
+    def _call_api(
+        self,
+        messages: List[Dict[str, str]],
+        max_tokens: int,
+        temperature: float,
+        response_format: Dict[str, Any] | None = None,
+        extra_body: Dict[str, Any] | None = None,
+    ) -> str:
         payload = {
             "model": self.model,
             "messages": messages,
             "max_tokens": max_tokens,
             "temperature": temperature,
+            "thinking": {"type": self.thinking_type},
         }
+        if response_format is not None:
+            payload["response_format"] = response_format
+        if extra_body:
+            payload.update(extra_body)
         body_bytes = json.dumps(payload).encode("utf-8")
         headers = {
             "Authorization": f"Bearer {self.api_key}",
@@ -69,15 +95,22 @@ class DeepSeekLLMGenerator:
                 raw = resp.read().decode("utf-8")
 
                 if resp.status != 200:
+                    logger.warning(
+                        "DeepSeek API HTTP error status=%s body=%s",
+                        resp.status,
+                        raw[:500].replace("\n", "\\n"),
+                    )
                     raise RuntimeError(f"DeepSeek API HTTP error {resp.status}: {raw[:500]}")
 
                 data = json.loads(raw)
                 break
             except (http.client.RemoteDisconnected, ConnectionResetError, BrokenPipeError, OSError) as e:
                 self._conn = None
+                logger.warning("DeepSeek API connection error (attempt %d): %s", attempt + 1, e)
                 if attempt == 1:
                     raise RuntimeError(f"DeepSeek API connection error: {e}") from e
             except json.JSONDecodeError as e:
+                logger.warning("DeepSeek API returned non-JSON body: %s", e)
                 raise RuntimeError(f"DeepSeek API returned non-JSON response: {e}") from e
 
         choices = data.get("choices")
@@ -98,20 +131,34 @@ class DeepSeekLLMGenerator:
         max_tokens: int = 256,
         temperature: float = 0.7,
         session: List[Dict[str, str]] | None = None,
+        response_format: Dict[str, Any] | None = None,
+        extra_body: Dict[str, Any] | None = None,
     ) -> str:
         if session is None:
             messages = [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
             ]
-            return self._call_api(messages, max_tokens=max_tokens, temperature=temperature)
+            return self._call_api(
+                messages,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                response_format=response_format,
+                extra_body=extra_body,
+            )
 
         messages = [
             *session,
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ]
-        content = self._call_api(messages, max_tokens=max_tokens, temperature=temperature)
+        content = self._call_api(
+            messages,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            response_format=response_format,
+            extra_body=extra_body,
+        )
         session.append({"role": "user", "content": user_prompt})
         session.append({"role": "assistant", "content": content})
         return content
@@ -132,6 +179,8 @@ class EventCardGenerator:
         self.max_delta_sum = 40
         self.verbose = verbose
         self.session_mode = session_mode
+        self.situation_repair_attempts = max(1, int(os.getenv("SITUATION_REPAIR_ATTEMPTS", 1)))
+        self.options_repair_attempts = max(1, int(os.getenv("OPTIONS_REPAIR_ATTEMPTS", 1)))
         self._global_session = self.gpt.create_session() if session_mode == "global" else None
         self._local_focus_pool = [
             "market stall licenses",
@@ -217,10 +266,30 @@ class EventCardGenerator:
             return truncated.strip() + '...'
 
     def _stats_compact(self, attributes: Dict[str, int]) -> str:
+        if not isinstance(attributes, dict):
+            raise ValueError("attributes must be an object with science/army/support/resources")
         return (
-            f"sci={attributes['science']} army={attributes['army']} "
-            f"sup={attributes['support']} res={attributes['resources']}"
+            f"sci={int(attributes['science'])} army={int(attributes['army'])} "
+            f"sup={int(attributes['support'])} res={int(attributes['resources'])}"
         )
+
+    def _status_context_compact(
+        self,
+        active_statuses: List[str] | None = None,
+        status_values: Dict[str, int] | None = None,
+    ) -> str:
+        parts: List[str] = []
+        values = status_values or {}
+
+        for name, value in values.items():
+            if int(value) > 0:
+                parts.append(f"{name}={int(value)}")
+
+        for name in active_statuses or []:
+            if name not in values:
+                parts.append(name)
+
+        return ", ".join(parts) if parts else "none"
 
     def _first_n_sentences(self, text: str, n: int) -> str:
         cleaned = text.strip()
@@ -228,6 +297,17 @@ class EventCardGenerator:
             return ""
         parts = re.split(r"(?<=[.!?])\s+", cleaned)
         return " ".join(parts[:n]).strip()
+
+    def _compact_line(self, text: str) -> str:
+        return re.sub(r"\s+", " ", (text or "").strip())
+
+    def _build_phrase_from_situation(self, situation: str) -> str:
+        cleaned = self._compact_line(situation).strip().strip('"').strip("'")
+        if not cleaned:
+            return "Your Majesty, we need your judgment."
+        if cleaned[-1] not in ".!?":
+            cleaned += "."
+        return self._truncate_at_sentence(cleaned, max_length=140)
 
     def _adjust_deltas(self, deltas: Dict[str, int]) -> Dict[str, int]:
         normalized = {k: int(v) for k, v in deltas.items()}
@@ -281,6 +361,113 @@ class EventCardGenerator:
                     return cleaned[start : idx + 1]
         return None
 
+    def _normalize_options_payload(self, payload: Any) -> Dict[str, Any]:
+        if isinstance(payload, list) and len(payload) >= 2:
+            payload = {"option_1": payload[0], "option_2": payload[1]}
+        if not isinstance(payload, dict):
+            raise ValueError("options payload is not a JSON object")
+
+        option_1 = (
+            payload.get("option_1")
+            or payload.get("option1")
+            or payload.get("first_option")
+            or payload.get("first")
+        )
+        option_2 = (
+            payload.get("option_2")
+            or payload.get("option2")
+            or payload.get("second_option")
+            or payload.get("second")
+        )
+
+        if option_1 is None or option_2 is None:
+            raise ValueError("options payload missing option_1/option_2")
+
+        return {"option_1": option_1, "option_2": option_2}
+
+    def _parse_options_payload(self, raw_text: str) -> Dict[str, Any]:
+        text = (raw_text or "").strip()
+        if not text:
+            raise ValueError("empty options response")
+
+        text = re.sub(r"<think>[\s\S]*?</think>", "", text, flags=re.IGNORECASE).strip()
+        candidates: List[str] = []
+        extracted = self._extract_first_json_object(text)
+        if extracted:
+            candidates.append(extracted)
+        candidates.append(text)
+
+        tried = []
+        for candidate in candidates:
+            snippet = candidate[:120].replace("\n", " ")
+            if snippet in tried:
+                continue
+            tried.append(snippet)
+            try:
+                parsed = json.loads(candidate)
+                return self._normalize_options_payload(parsed)
+            except Exception:
+                pass
+            try:
+                parsed = ast.literal_eval(candidate)
+                return self._normalize_options_payload(parsed)
+            except Exception:
+                pass
+
+        raise ValueError("unable to parse options payload into JSON")
+
+    def _normalize_situation_payload(self, payload: Any) -> Dict[str, str]:
+        if not isinstance(payload, dict):
+            raise ValueError("situation payload is not a JSON object")
+
+        situation = (
+            payload.get("situation")
+            or payload.get("problem")
+            or payload.get("context")
+            or payload.get("story")
+        )
+        phrase = (
+            payload.get("phrase")
+            or payload.get("quote")
+            or payload.get("complaint")
+            or payload.get("visitor_quote")
+        )
+
+        if situation is None or phrase is None:
+            raise ValueError("situation payload missing situation/phrase")
+        return {"situation": str(situation), "phrase": str(phrase)}
+
+    def _parse_situation_payload(self, raw_text: str) -> Dict[str, str]:
+        text = (raw_text or "").strip()
+        if not text:
+            raise ValueError("empty situation response")
+
+        text = re.sub(r"<think>[\s\S]*?</think>", "", text, flags=re.IGNORECASE).strip()
+        candidates: List[str] = []
+        extracted = self._extract_first_json_object(text)
+        if extracted:
+            candidates.append(extracted)
+        candidates.append(text)
+
+        tried = []
+        for candidate in candidates:
+            snippet = candidate[:120].replace("\n", " ")
+            if snippet in tried:
+                continue
+            tried.append(snippet)
+            try:
+                parsed = json.loads(candidate)
+                return self._normalize_situation_payload(parsed)
+            except Exception:
+                pass
+            try:
+                parsed = ast.literal_eval(candidate)
+                return self._normalize_situation_payload(parsed)
+            except Exception:
+                pass
+
+        raise ValueError("unable to parse situation payload into JSON")
+
     def validate_deltas(self, option: Dict[str, Any]) -> bool:
         delta_sum = (
             abs(option.get("science", 0)) +
@@ -319,52 +506,94 @@ class EventCardGenerator:
         attributes: Dict[str, int],
         session: List[Dict[str, str]] | None = None,
         focus_hint: str | None = None,
+        active_statuses: List[str] | None = None,
+        status_values: Dict[str, int] | None = None,
     ) -> tuple[str, str]:
         stats = self._stats_compact(attributes)
+        statuses = self._status_context_compact(active_statuses, status_values)
 
         situation_prompt = (
-            f"Stats: {stats}. Focus: {focus_hint or 'any local issue'}.\n"
-            "2 short sentences: a local medieval governance problem (village/market/road/mill/guild scale).\n"
-            "S1=what happened locally. S2=what the king must decide now.\n"
-            "No epic scale, no wars, no prophecy."
+            f"Stats: {stats}. Statuses: {statuses}. Focus: {focus_hint or 'any local issue'}.\n"
+            "Return exactly one JSON object with keys: situation, phrase.\n"
+            "situation: exactly 1 short sentence about a local medieval governance problem (village/market/road/mill/guild scale).\n"
+            "phrase: visitor complaint quote to the king, <=18 words, problem only.\n"
+            "Do NOT include actions/options/alternatives in either field.\n"
+            "No markdown, no extra keys, no epic scale, no wars, no prophecy."
         )
 
-        situation_system_prompt = "2 plain sentences only. Simple, local, specific."
-        raw_situation = self.gpt.generate(
+        situation_system_prompt = "Return strictly valid JSON only."
+        response = self.gpt.generate(
             situation_system_prompt,
             situation_prompt,
-            max_tokens=48,
-            temperature=0.6,
+            max_tokens=96,
+            temperature=0.4,
             session=session,
+            response_format={"type": "json_object"},
         )
+        try:
+            situation_data = self._parse_situation_payload(response)
+        except Exception as parse_error:
+            logger.warning(
+                "Primary situation parse failed: %s; raw=%s",
+                parse_error,
+                (response or "")[:300].replace("\n", "\\n"),
+            )
+            repair_system_prompt = "Return strictly valid JSON only. No markdown, no comments."
+            repair_prompt = (
+                "Return exactly one JSON object with keys situation and phrase.\n"
+                "situation must be one concise sentence with local governance problem only.\n"
+                "phrase must be complaint quote <=18 words, no action proposals.\n"
+                f"Stats: {stats}\nStatuses: {statuses}\nFocus: {focus_hint or 'any local issue'}\n"
+                f"Source text:\n{response}"
+            )
+            last_error = parse_error
+            situation_data = None
+            for repair_idx in range(self.situation_repair_attempts):
+                repaired = self.gpt.generate(
+                    repair_system_prompt,
+                    repair_prompt,
+                    max_tokens=120,
+                    temperature=0.1,
+                    session=None,
+                    response_format={"type": "json_object"},
+                )
+                try:
+                    situation_data = self._parse_situation_payload(repaired)
+                    break
+                except Exception as repair_error:
+                    last_error = repair_error
+                    logger.warning(
+                        "Repair situation parse failed (attempt %d): %s; repaired=%s",
+                        repair_idx + 1,
+                        repair_error,
+                        (repaired or "")[:300].replace("\n", "\\n"),
+                    )
+            if situation_data is None:
+                raise ValueError(
+                    f"situation JSON parse failed after repair attempts: {last_error}"
+                ) from last_error
 
-        raw_situation = raw_situation.strip()
-        situation_part = raw_situation.split('\n\n')[0] if '\n\n' in raw_situation else raw_situation.split('\n')[0]
-        situation = self._first_n_sentences(situation_part, 2)
-        situation = self._truncate_at_sentence(situation, max_length=260)
+        raw_situation = self._compact_line(situation_data.get("situation", ""))
+        situation = self._first_n_sentences(raw_situation, 1)
+        situation = re.split(r"(?i)\b(option\s*1|option\s*2|choice\s*1|choice\s*2)\b", situation, maxsplit=1)[0].strip()
+        situation = re.split(r"(?i)\b(should we|choose between|the king must choose)\b", situation, maxsplit=1)[0].strip()
+        situation = self._truncate_at_sentence(situation, max_length=120)
 
-        phrase_prompt = (
-            f"Situation: {situation}\n"
-            "Visitor's direct quote to the king, <=15 words. Only the quote."
-        )
-
-        phrase_system_prompt = "Quote text only."
-        response = self.gpt.generate(
-            phrase_system_prompt,
-            phrase_prompt,
-            max_tokens=30,
-            temperature=1.3,
-            session=session,
-        )
-
-        phrase = response.strip().strip('"').strip("'")
-        phrase_part = phrase.split('\n\n')[0] if '\n\n' in phrase else phrase.split('\n')[0]
-        phrase = self._truncate_at_sentence(phrase_part, max_length=150)
+        raw_phrase = self._compact_line(situation_data.get("phrase", "")).strip('"').strip("'")
+        raw_phrase = re.split(
+            r"(?i)\b(should we|choose between|option\s*1|option\s*2|choice\s*1|choice\s*2)\b",
+            raw_phrase,
+            maxsplit=1,
+        )[0].strip()
+        words = raw_phrase.split()
+        if len(words) > 18:
+            raw_phrase = " ".join(words[:18])
+        phrase = self._truncate_at_sentence(raw_phrase, max_length=150)
 
         if not situation:
             situation = "A visitor comes to the king with an important matter."
         if not phrase:
-            phrase = "Your Majesty, I come with an important matter that requires your attention."
+            phrase = self._build_phrase_from_situation(situation)
 
         return situation, phrase
 
@@ -374,21 +603,71 @@ class EventCardGenerator:
         phrase: str,
         attributes: Dict[str, int],
         session: List[Dict[str, str]] | None = None,
+        active_statuses: List[str] | None = None,
+        status_values: Dict[str, int] | None = None,
     ) -> tuple[Dict[str, Any], Dict[str, Any]]:
         stats = self._stats_compact(attributes)
+        statuses = self._status_context_compact(active_statuses, status_values)
 
         prompt = (
-            f"Stats: {stats}\nSituation: {situation}\nQuote: {phrase}\n"
+            f"Stats: {stats}\nStatuses: {statuses}\nSituation: {situation}\nQuote: {phrase}\n"
             "2 king decisions. JSON only:\n"
             '{"option_1":{"description":"<4 words","science":int,"army":int,"support":int,"resources":int},'
             '"option_2":{...}}'
         )
 
         system_prompt = "Valid JSON only."
-        response = self.gpt.generate(system_prompt, prompt, max_tokens=160, temperature=0.8, session=session)
-
-        extracted = self._extract_first_json_object(response)
-        data = json.loads(extracted if extracted else response)
+        response = self.gpt.generate(
+            system_prompt,
+            prompt,
+            max_tokens=360,
+            temperature=0.2,
+            session=session,
+            response_format={"type": "json_object"},
+        )
+        try:
+            data = self._parse_options_payload(response)
+        except Exception as parse_error:
+            logger.warning(
+                "Primary options parse failed: %s; raw=%s",
+                parse_error,
+                (response or "")[:300].replace("\n", "\\n"),
+            )
+            repair_system_prompt = "Return strictly valid JSON only. No markdown, no comments."
+            repair_prompt = (
+                "Return exactly one JSON object with keys option_1 and option_2.\n"
+                "Each option must contain: description, science, army, support, resources.\n"
+                "description must be <=4 words.\n"
+                f"Stats: {stats}\nStatuses: {statuses}\nSituation: {situation}\nQuote: {phrase}\n"
+                "If the source text is malformed, reconstruct valid options from context.\n"
+                f"Source text:\n{response}"
+            )
+            last_error = parse_error
+            data = None
+            for repair_idx in range(self.options_repair_attempts):
+                repaired = self.gpt.generate(
+                    repair_system_prompt,
+                    repair_prompt,
+                    max_tokens=420,
+                    temperature=0.1,
+                    session=None,
+                    response_format={"type": "json_object"},
+                )
+                try:
+                    data = self._parse_options_payload(repaired)
+                    break
+                except Exception as repair_error:
+                    last_error = repair_error
+                    logger.warning(
+                        "Repair options parse failed (attempt %d): %s; repaired=%s",
+                        repair_idx + 1,
+                        repair_error,
+                        (repaired or "")[:300].replace("\n", "\\n"),
+                    )
+            if data is None:
+                raise ValueError(
+                    f"options JSON parse failed after repair attempts: {last_error}"
+                ) from last_error
 
         def normalize_option(option_data: Any, option_number: int) -> Dict[str, Any]:
             if not isinstance(option_data, dict):
@@ -426,23 +705,45 @@ class EventCardGenerator:
 
         return option_1, option_2
 
-    def generate_card(self, attributes: Dict[str, int], max_retries: int = 3) -> Dict[str, Any]:
+    def generate_card(
+        self,
+        attributes: Dict[str, int],
+        max_retries: int = 3,
+        active_statuses: List[str] | None = None,
+        status_values: Dict[str, int] | None = None,
+        session: List[Dict[str, str]] | None = None,
+    ) -> Dict[str, Any]:
         used_focuses: set[str] = set()
+        last_error: Exception | None = None
+        attempt_errors: List[str] = []
         for attempt in range(max_retries):
             try:
                 if self.verbose and attempt > 0:
                     print(f"  Retry {attempt}/{max_retries-1}")
 
-                session = self._new_card_session()
+                if session is None:
+                    card_session = self._new_card_session()
+                else:
+                    card_session = list(session)
                 focus = self._pick_focus(blocked_focuses=used_focuses)
                 used_focuses.add(focus)
 
-                situation, phrase = self.generate_situation(attributes, session=session, focus_hint=focus)
+                situation, phrase = self.generate_situation(
+                    attributes,
+                    session=card_session,
+                    focus_hint=focus,
+                    active_statuses=active_statuses,
+                    status_values=status_values,
+                )
 
-                if self._is_too_similar_to_recent(situation):
-                    raise ValueError("situation too similar to recent cards")
-
-                option_1, option_2 = self.generate_options(situation, phrase, attributes, session=session)
+                option_1, option_2 = self.generate_options(
+                    situation,
+                    phrase,
+                    attributes,
+                    session=card_session,
+                    active_statuses=active_statuses,
+                    status_values=status_values,
+                )
 
                 card = {
                     "situation": situation,
@@ -453,25 +754,70 @@ class EventCardGenerator:
 
                 is_valid, message = self.validate_card(card)
                 if is_valid:
+                    if session is not None and card_session is not None:
+                        session.clear()
+                        session.extend(card_session)
                     self._recent_focuses.append(focus)
                     self._recent_situations.append(situation)
                     return card
-                elif self.verbose:
+                last_error = ValueError(f"Validation failed: {message}")
+                attempt_errors.append(
+                    f"#{attempt + 1} validation failed: {message}"
+                )
+                logger.warning(
+                    "Card attempt %d/%d validation failed: %s",
+                    attempt + 1,
+                    max_retries,
+                    message,
+                )
+                if self.verbose:
                     print(f"  Validation failed: {message}")
 
             except Exception as e:
+                last_error = e
+                attempt_errors.append(
+                    f"#{attempt + 1} {type(e).__name__}: {e}"
+                )
+                logger.warning(
+                    "Card attempt %d/%d failed: %s: %s",
+                    attempt + 1,
+                    max_retries,
+                    type(e).__name__,
+                    e,
+                )
                 if self.verbose:
                     print(f"  Error: {e}")
 
-        raise Exception(f"Failed to generate valid card after {max_retries} attempts")
+        if attempt_errors:
+            reason = " | ".join(attempt_errors[-3:])
+        else:
+            reason = str(last_error) if last_error else "unknown reason"
+        logger.warning("Card generation exhausted retries: %s", reason)
+        raise CardGenerationError(
+            f"Failed to generate valid card after {max_retries} attempts: {reason}"
+        ) from last_error
 
-    def generate_cards(self, attributes: Dict[str, int], num_cards: int = 1) -> List[Dict[str, Any]]:
+    def generate_cards(
+        self,
+        attributes: Dict[str, int],
+        num_cards: int = 1,
+        max_retries: int = 3,
+        active_statuses: List[str] | None = None,
+        status_values: Dict[str, int] | None = None,
+        session: List[Dict[str, str]] | None = None,
+    ) -> List[Dict[str, Any]]:
         if self.verbose:
             print(f"Generating {num_cards} card(s)...", end="", flush=True)
 
         cards = []
         for i in range(num_cards):
-            card = self.generate_card(attributes)
+            card = self.generate_card(
+                attributes,
+                max_retries=max_retries,
+                active_statuses=active_statuses,
+                status_values=status_values,
+                session=session,
+            )
             cards.append(card)
             if self.verbose:
                 print(f" {i+1}", end="", flush=True)
