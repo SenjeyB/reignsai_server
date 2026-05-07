@@ -5,6 +5,7 @@ import os
 import random
 import re
 import ssl
+import threading
 import logging
 from collections import deque
 from typing import Dict, List, Any
@@ -43,23 +44,39 @@ class DeepSeekLLMGenerator:
         self._port = parsed.port or 443
         self._path = (parsed.path or "").rstrip("/") + "/chat/completions"
         self._ssl_ctx = ssl.create_default_context()
-        self._conn: http.client.HTTPSConnection | None = None
+        self._tls = threading.local()
 
     def create_session(self) -> List[Dict[str, str]]:
         return []
 
     def _get_conn(self) -> http.client.HTTPSConnection:
-        if self._conn is not None:
+        conn = getattr(self._tls, "conn", None)
+        if conn is not None:
             try:
-                self._conn.request("HEAD", "/", headers={"Connection": "keep-alive"})
-                self._conn.getresponse().read()
+                conn.request("HEAD", "/", headers={"Connection": "keep-alive"})
+                conn.getresponse().read()
             except Exception:
-                self._conn = None
-        if self._conn is None:
-            self._conn = http.client.HTTPSConnection(
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                conn = None
+                self._tls.conn = None
+        if conn is None:
+            conn = http.client.HTTPSConnection(
                 self._host, self._port, context=self._ssl_ctx, timeout=60
             )
-        return self._conn
+            self._tls.conn = conn
+        return conn
+
+    def _drop_conn(self) -> None:
+        conn = getattr(self._tls, "conn", None)
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+        self._tls.conn = None
 
     def _call_api(
         self,
@@ -105,7 +122,7 @@ class DeepSeekLLMGenerator:
                 data = json.loads(raw)
                 break
             except (http.client.RemoteDisconnected, ConnectionResetError, BrokenPipeError, OSError) as e:
-                self._conn = None
+                self._drop_conn()
                 logger.warning("DeepSeek API connection error (attempt %d): %s", attempt + 1, e)
                 if attempt == 1:
                     raise RuntimeError(f"DeepSeek API connection error: {e}") from e
@@ -164,12 +181,7 @@ class DeepSeekLLMGenerator:
         return content
 
     def cleanup(self) -> None:
-        if self._conn is not None:
-            try:
-                self._conn.close()
-            except Exception:
-                pass
-            self._conn = None
+        self._drop_conn()
 
 
 class EventCardGenerator:
@@ -508,12 +520,15 @@ class EventCardGenerator:
         focus_hint: str | None = None,
         active_statuses: List[str] | None = None,
         status_values: Dict[str, int] | None = None,
+        month: str | None = None,
     ) -> tuple[str, str]:
         stats = self._stats_compact(attributes)
         statuses = self._status_context_compact(active_statuses, status_values)
+        month_line = f"Month: {month}. Use the season subtly when it fits (harvest, frost, plague, festival).\n" if month else ""
 
         situation_prompt = (
             f"Stats: {stats}. Statuses: {statuses}. Focus: {focus_hint or 'any local issue'}.\n"
+            f"{month_line}"
             "Return exactly one JSON object with keys: situation, phrase.\n"
             "situation: exactly 1 short sentence about a local medieval governance problem (village/market/road/mill/guild scale).\n"
             "phrase: visitor complaint quote to the king, <=18 words, problem only.\n"
@@ -605,12 +620,14 @@ class EventCardGenerator:
         session: List[Dict[str, str]] | None = None,
         active_statuses: List[str] | None = None,
         status_values: Dict[str, int] | None = None,
+        month: str | None = None,
     ) -> tuple[Dict[str, Any], Dict[str, Any]]:
         stats = self._stats_compact(attributes)
         statuses = self._status_context_compact(active_statuses, status_values)
+        month_line = f"Month: {month}\n" if month else ""
 
         prompt = (
-            f"Stats: {stats}\nStatuses: {statuses}\nSituation: {situation}\nQuote: {phrase}\n"
+            f"Stats: {stats}\nStatuses: {statuses}\n{month_line}Situation: {situation}\nQuote: {phrase}\n"
             "2 king decisions. JSON only:\n"
             '{"option_1":{"description":"<4 words","science":int,"army":int,"support":int,"resources":int},'
             '"option_2":{...}}'
@@ -712,6 +729,7 @@ class EventCardGenerator:
         active_statuses: List[str] | None = None,
         status_values: Dict[str, int] | None = None,
         session: List[Dict[str, str]] | None = None,
+        month: str | None = None,
     ) -> Dict[str, Any]:
         used_focuses: set[str] = set()
         last_error: Exception | None = None
@@ -734,6 +752,7 @@ class EventCardGenerator:
                     focus_hint=focus,
                     active_statuses=active_statuses,
                     status_values=status_values,
+                    month=month,
                 )
 
                 option_1, option_2 = self.generate_options(
@@ -743,6 +762,7 @@ class EventCardGenerator:
                     session=card_session,
                     active_statuses=active_statuses,
                     status_values=status_values,
+                    month=month,
                 )
 
                 card = {
@@ -805,6 +825,7 @@ class EventCardGenerator:
         active_statuses: List[str] | None = None,
         status_values: Dict[str, int] | None = None,
         session: List[Dict[str, str]] | None = None,
+        month: str | None = None,
     ) -> List[Dict[str, Any]]:
         if self.verbose:
             print(f"Generating {num_cards} card(s)...", end="", flush=True)
@@ -817,6 +838,7 @@ class EventCardGenerator:
                 active_statuses=active_statuses,
                 status_values=status_values,
                 session=session,
+                month=month,
             )
             cards.append(card)
             if self.verbose:

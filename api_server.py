@@ -63,6 +63,9 @@ SESSION_INIT_RATE_LIMIT = os.getenv(
 )
 CHAT_SESSION_TTL_SECONDS = int(os.getenv('CHAT_SESSION_TTL_SECONDS', 7200))
 CHAT_SESSION_MAX_ACTIVE = int(os.getenv('CHAT_SESSION_MAX_ACTIVE', 500))
+WARM_POOL_SIZE = int(os.getenv('WARM_POOL_SIZE', 3))
+WARM_BATCH_SIZE = int(os.getenv('WARM_BATCH_SIZE', 5))
+WARM_REFILL_MAX_IN_FLIGHT = int(os.getenv('WARM_REFILL_MAX_IN_FLIGHT', 2))
 
 
 class OverloadedError(Exception):
@@ -121,6 +124,7 @@ class ChatSessionStore:
                 "lock": threading.RLock(),
                 "created_at": now_ts,
                 "last_used": now_ts,
+                "served_warm": False,
             }
         return session_id
 
@@ -141,8 +145,113 @@ class ChatSessionStore:
         session_lock.acquire()
         return history, session_lock
 
+    def try_take_warm_slot(self, session_id: str | None) -> bool:
+        if not session_id:
+            return False
+        now_ts = time.time()
+        with self._lock:
+            item = self._items.get(session_id)
+            if item is None or item.get("served_warm"):
+                return False
+            item["served_warm"] = True
+            item["last_used"] = now_ts
+            return True
+
+    def revert_warm_slot(self, session_id: str | None) -> None:
+        if not session_id:
+            return
+        with self._lock:
+            item = self._items.get(session_id)
+            if item is not None:
+                item["served_warm"] = False
+
 
 chat_sessions = ChatSessionStore(CHAT_SESSION_TTL_SECONDS, CHAT_SESSION_MAX_ACTIVE)
+
+
+class WarmCardPool:
+    def __init__(self, target_size: int, batch_size: int, max_in_flight: int):
+        self.target_size = max(0, int(target_size))
+        self.batch_size = max(1, int(batch_size))
+        self.max_in_flight = max(1, int(max_in_flight))
+        self._lock = threading.Lock()
+        self._items: list[list] = []
+        self._in_flight = 0
+
+    def take(self):
+        with self._lock:
+            if not self._items:
+                return None
+            return self._items.pop(0)
+
+    def stats(self):
+        with self._lock:
+            return {
+                "ready": len(self._items),
+                "target": self.target_size,
+                "in_flight": self._in_flight,
+                "batch_size": self.batch_size,
+            }
+
+    def schedule_refill(self) -> int:
+        if self.target_size <= 0:
+            return 0
+        with self._lock:
+            deficit = self.target_size - len(self._items) - self._in_flight
+            launchable = min(deficit, max(0, self.max_in_flight - self._in_flight))
+            if launchable <= 0:
+                return 0
+            self._in_flight += launchable
+        for _ in range(launchable):
+            _executor.submit(self._refill_one)
+        return launchable
+
+    def _refill_one(self):
+        try:
+            llm_semaphore.acquire()
+            try:
+                batch = generator.generate_cards(
+                    DEFAULT_ATTRIBUTES.copy(),
+                    num_cards=self.batch_size,
+                    max_retries=CARD_GEN_RETRIES,
+                )
+            finally:
+                try:
+                    llm_semaphore.release()
+                except Exception:
+                    pass
+            if batch and len(batch) == self.batch_size:
+                with self._lock:
+                    self._items.append(batch)
+                logger.info("warm pool refilled (now ready=%d/%d)",
+                            len(self._items), self.target_size)
+            else:
+                logger.warning("warm pool refill produced empty/partial batch")
+        except Exception:
+            logger.exception("warm pool refill failed")
+        finally:
+            with self._lock:
+                self._in_flight -= 1
+
+
+warm_pool = WarmCardPool(WARM_POOL_SIZE, WARM_BATCH_SIZE, WARM_REFILL_MAX_IN_FLIGHT)
+
+
+def _try_serve_warm_batch(session_id: str | None, count: int, request_id: str):
+    if not session_id or count <= 0 or count > WARM_BATCH_SIZE:
+        return None
+    if not chat_sessions.try_take_warm_slot(session_id):
+        return None
+    batch = warm_pool.take()
+    if batch is None:
+        chat_sessions.revert_warm_slot(session_id)
+        logger.info("[req:%s] warm pool empty, falling through to LLM", request_id)
+        return None
+    warm_pool.schedule_refill()
+    served = batch[:count]
+    logger.info("[req:%s] served warm batch (count=%d, pool_stats=%s)",
+                request_id, len(served), warm_pool.stats())
+    return served
 
 
 def _request_id():
@@ -344,6 +453,25 @@ def _normalize_count(raw_count, default_count):
     return max(1, min(count, MAX_CARDS))
 
 
+_MONTH_NAMES = {
+    "january", "february", "march", "april", "may", "june",
+    "july", "august", "september", "october", "november", "december",
+}
+
+
+def _normalize_month(raw_month):
+    if raw_month is None:
+        return None
+    text = str(raw_month).strip()
+    if not text:
+        return None
+    canonical = text.lower()
+    if canonical not in _MONTH_NAMES:
+        logger.warning("[req:%s] Unknown month value %r, ignoring", _request_id(), text)
+        return None
+    return canonical.capitalize()
+
+
 def run_generation_safe(
     attributes,
     num_cards,
@@ -351,14 +479,16 @@ def run_generation_safe(
     status_values=None,
     chat_session=None,
     request_id="-",
+    month=None,
 ):
     logger.info(
-        "[req:%s] generation start count=%s attrs=%s statuses=%s status_values=%s session_ctx=%s",
+        "[req:%s] generation start count=%s attrs=%s statuses=%s status_values=%s month=%s session_ctx=%s",
         request_id,
         num_cards,
         _truncate_for_log(attributes),
         _truncate_for_log(active_statuses),
         _truncate_for_log(status_values),
+        month or "none",
         "yes" if chat_session is not None else "no",
     )
     acquired = llm_semaphore.acquire(timeout=LLM_QUEUE_ACQUIRE_TIMEOUT)
@@ -378,6 +508,7 @@ def run_generation_safe(
                 active_statuses,
                 status_values,
                 chat_session,
+                month,
             )
             try:
                 return future.result(timeout=GEN_TIMEOUT)
@@ -480,9 +611,22 @@ def generate_cards():
     try:
         data = _parse_request_json()
         count = _normalize_count(data.get('count', 1), 1)
+        session_id = str(data.get("session_id", "")).strip()
+
+        warm_cards = _try_serve_warm_batch(session_id or None, count, req_id)
+        if warm_cards is not None:
+            return jsonify({
+                "success": True,
+                "data": {
+                    "cards": warm_cards,
+                    "count": len(warm_cards),
+                    "session_id": session_id if session_id else None,
+                    "warm": True,
+                }
+            })
+
         attributes_source = data.get('attributes', data)
         attributes = _normalize_attributes(attributes_source)
-        session_id = str(data.get("session_id", "")).strip()
         if session_id:
             chat_session, chat_session_lock = chat_sessions.acquire(session_id)
             if chat_session is None:
@@ -497,6 +641,7 @@ def generate_cards():
             raw_status_values = {"in_war": data.get("in_war")}
 
         active_statuses, status_values = _normalize_status_context(raw_statuses, raw_status_values)
+        month = _normalize_month(data.get('month'))
         cards = run_generation_safe(
             attributes,
             num_cards=count,
@@ -504,6 +649,7 @@ def generate_cards():
             status_values=status_values,
             chat_session=chat_session,
             request_id=req_id,
+            month=month,
         )
 
         return jsonify({
@@ -563,6 +709,7 @@ def get_random_card():
             raw_statuses=query.get("statuses"),
             raw_status_values=query_status_values if query_status_values else None,
         )
+        month = _normalize_month(query.get('month'))
         cards = run_generation_safe(
             attributes,
             num_cards=count,
@@ -570,6 +717,7 @@ def get_random_card():
             status_values=status_values,
             chat_session=chat_session,
             request_id=req_id,
+            month=month,
         )
 
         return jsonify({
@@ -610,9 +758,23 @@ def get_batch_cards():
     try:
         data = _parse_request_json()
         count = _normalize_count(data.get('count', 3), 3)
+        session_id = str(data.get("session_id", "")).strip()
+
+        warm_cards = _try_serve_warm_batch(session_id or None, count, req_id)
+        if warm_cards is not None:
+            return jsonify({
+                "success": True,
+                "data": {
+                    "cards": warm_cards,
+                    "count": len(warm_cards),
+                    "requested": count,
+                    "session_id": session_id if session_id else None,
+                    "warm": True,
+                }
+            })
+
         attributes_source = data.get('attributes', data)
         attributes = _normalize_attributes(attributes_source)
-        session_id = str(data.get("session_id", "")).strip()
         if session_id:
             chat_session, chat_session_lock = chat_sessions.acquire(session_id)
             if chat_session is None:
@@ -627,6 +789,7 @@ def get_batch_cards():
             raw_status_values = {"in_war": data.get("in_war")}
 
         active_statuses, status_values = _normalize_status_context(raw_statuses, raw_status_values)
+        month = _normalize_month(data.get('month'))
         cards = run_generation_safe(
             attributes,
             num_cards=count,
@@ -634,6 +797,7 @@ def get_batch_cards():
             status_values=status_values,
             chat_session=chat_session,
             request_id=req_id,
+            month=month,
         )
 
         return jsonify({
@@ -670,7 +834,8 @@ def get_batch_cards():
 def get_stats():
     return jsonify({
         "generator": "active",
-        "llm_provider": "deepseek"
+        "llm_provider": "deepseek",
+        "warm_pool": warm_pool.stats(),
     })
 
 
@@ -683,9 +848,13 @@ def ratelimit_handler(e):
     }), 429
 
 
+warm_pool.schedule_refill()
+
+
 if __name__ == '__main__':
     print("Event Card Generator API Server")
     print("LLM: DeepSeek (deepseek-v4-flash)")
     print(f"DeepSeek thinking: {llm.thinking_type}")
+    print(f"Warm pool: target={WARM_POOL_SIZE} batch={WARM_BATCH_SIZE}")
     print("Ready to generate cards on-demand")
     app.run(host=ConfigClass.HOST, port=ConfigClass.PORT, debug=ConfigClass.DEBUG)
