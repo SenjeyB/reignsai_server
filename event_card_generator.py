@@ -189,6 +189,7 @@ class EventCardGenerator:
     def __init__(self, llm_generator: DeepSeekLLMGenerator, verbose: bool = True, session_mode: str = "per-card"):
         self.gpt = llm_generator
         self.max_delta_sum = 40
+        self.max_delta_per_stat = 20
         self.verbose = verbose
         self.session_mode = session_mode
         self.situation_repair_attempts = max(1, int(os.getenv("SITUATION_REPAIR_ATTEMPTS", 1)))
@@ -322,7 +323,8 @@ class EventCardGenerator:
         return self._truncate_at_sentence(cleaned, max_length=140)
 
     def _adjust_deltas(self, deltas: Dict[str, int]) -> Dict[str, int]:
-        normalized = {k: int(v) for k, v in deltas.items()}
+        cap = self.max_delta_per_stat
+        normalized = {k: max(-cap, min(cap, int(v))) for k, v in deltas.items()}
         current_sum = sum(abs(v) for v in normalized.values())
 
         if current_sum == 0:
@@ -481,6 +483,10 @@ class EventCardGenerator:
         raise ValueError("unable to parse situation payload into JSON")
 
     def validate_deltas(self, option: Dict[str, Any]) -> bool:
+        cap = self.max_delta_per_stat
+        for key in ("science", "army", "support", "resources"):
+            if abs(int(option.get(key, 0))) > cap:
+                return False
         delta_sum = (
             abs(option.get("science", 0)) +
             abs(option.get("army", 0)) +
@@ -630,7 +636,9 @@ class EventCardGenerator:
             f"Stats: {stats}\nStatuses: {statuses}\n{month_line}Situation: {situation}\nQuote: {phrase}\n"
             "2 king decisions. JSON only:\n"
             '{"option_1":{"description":"<4 words","science":int,"army":int,"support":int,"resources":int},'
-            '"option_2":{...}}'
+            '"option_2":{...}}\n'
+            f"Each stat delta MUST be an integer in [-{self.max_delta_per_stat}, {self.max_delta_per_stat}]. "
+            f"Total |sum| across all four stats per option <= {self.max_delta_sum}."
         )
 
         system_prompt = "Valid JSON only."
