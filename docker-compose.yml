@@ -13,9 +13,9 @@ services:
       - MAX_CARDS_PER_REQUEST=20
       - LLM_CONCURRENCY=4
       - LLM_RETRIES=3
-      - WARM_POOL_SIZE=3
-      - WARM_BATCH_SIZE=5
-      - WARM_REFILL_MAX_IN_FLIGHT=2
+      - COLD_POOL_SIZE=4
+      - COLD_BATCH_SIZE=5
+      - COLD_REFILL_MAX_IN_FLIGHT=1
     depends_on:
       - redis
     restart: unless-stopped

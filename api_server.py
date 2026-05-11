@@ -5,10 +5,8 @@ from flask_cors import CORS
 import json
 import random
 import os
-import sys
 import logging
 import concurrent.futures
-from functools import wraps
 import threading
 import time
 import uuid
@@ -63,9 +61,13 @@ SESSION_INIT_RATE_LIMIT = os.getenv(
 )
 CHAT_SESSION_TTL_SECONDS = int(os.getenv('CHAT_SESSION_TTL_SECONDS', 7200))
 CHAT_SESSION_MAX_ACTIVE = int(os.getenv('CHAT_SESSION_MAX_ACTIVE', 500))
-WARM_POOL_SIZE = int(os.getenv('WARM_POOL_SIZE', 3))
-WARM_BATCH_SIZE = int(os.getenv('WARM_BATCH_SIZE', 5))
-WARM_REFILL_MAX_IN_FLIGHT = int(os.getenv('WARM_REFILL_MAX_IN_FLIGHT', 2))
+COLD_POOL_SIZE = int(os.getenv('COLD_POOL_SIZE', 4))
+COLD_BATCH_SIZE = int(os.getenv('COLD_BATCH_SIZE', 5))
+COLD_REFILL_MAX_IN_FLIGHT = int(os.getenv('COLD_REFILL_MAX_IN_FLIGHT', 1))
+COLD_RATE_LIMIT = os.getenv(
+    'COLD_RATE_LIMIT',
+    '60 per minute' if ConfigClass.DEBUG else '15 per minute'
+)
 
 
 class OverloadedError(Exception):
@@ -124,7 +126,6 @@ class ChatSessionStore:
                 "lock": threading.RLock(),
                 "created_at": now_ts,
                 "last_used": now_ts,
-                "served_warm": False,
             }
         return session_id
 
@@ -145,31 +146,11 @@ class ChatSessionStore:
         session_lock.acquire()
         return history, session_lock
 
-    def try_take_warm_slot(self, session_id: str | None) -> bool:
-        if not session_id:
-            return False
-        now_ts = time.time()
-        with self._lock:
-            item = self._items.get(session_id)
-            if item is None or item.get("served_warm"):
-                return False
-            item["served_warm"] = True
-            item["last_used"] = now_ts
-            return True
-
-    def revert_warm_slot(self, session_id: str | None) -> None:
-        if not session_id:
-            return
-        with self._lock:
-            item = self._items.get(session_id)
-            if item is not None:
-                item["served_warm"] = False
-
 
 chat_sessions = ChatSessionStore(CHAT_SESSION_TTL_SECONDS, CHAT_SESSION_MAX_ACTIVE)
 
 
-class WarmCardPool:
+class ColdStartCardPool:
     def __init__(self, target_size: int, batch_size: int, max_in_flight: int):
         self.target_size = max(0, int(target_size))
         self.batch_size = max(1, int(batch_size))
@@ -214,6 +195,7 @@ class WarmCardPool:
                     DEFAULT_ATTRIBUTES.copy(),
                     num_cards=self.batch_size,
                     max_retries=CARD_GEN_RETRIES,
+                    month=None,
                 )
             finally:
                 try:
@@ -223,35 +205,18 @@ class WarmCardPool:
             if batch and len(batch) == self.batch_size:
                 with self._lock:
                     self._items.append(batch)
-                logger.info("warm pool refilled (now ready=%d/%d)",
+                logger.info("cold pool refilled (now ready=%d/%d)",
                             len(self._items), self.target_size)
             else:
-                logger.warning("warm pool refill produced empty/partial batch")
+                logger.warning("cold pool refill produced empty/partial batch")
         except Exception:
-            logger.exception("warm pool refill failed")
+            logger.exception("cold pool refill failed")
         finally:
             with self._lock:
                 self._in_flight -= 1
 
 
-warm_pool = WarmCardPool(WARM_POOL_SIZE, WARM_BATCH_SIZE, WARM_REFILL_MAX_IN_FLIGHT)
-
-
-def _try_serve_warm_batch(session_id: str | None, count: int, request_id: str):
-    if not session_id or count <= 0 or count > WARM_BATCH_SIZE:
-        return None
-    if not chat_sessions.try_take_warm_slot(session_id):
-        return None
-    batch = warm_pool.take()
-    if batch is None:
-        chat_sessions.revert_warm_slot(session_id)
-        logger.info("[req:%s] warm pool empty, falling through to LLM", request_id)
-        return None
-    warm_pool.schedule_refill()
-    served = batch[:count]
-    logger.info("[req:%s] served warm batch (count=%d, pool_stats=%s)",
-                request_id, len(served), warm_pool.stats())
-    return served
+cold_pool = ColdStartCardPool(COLD_POOL_SIZE, COLD_BATCH_SIZE, COLD_REFILL_MAX_IN_FLIGHT)
 
 
 def _request_id():
@@ -613,18 +578,6 @@ def generate_cards():
         count = _normalize_count(data.get('count', 1), 1)
         session_id = str(data.get("session_id", "")).strip()
 
-        warm_cards = _try_serve_warm_batch(session_id or None, count, req_id)
-        if warm_cards is not None:
-            return jsonify({
-                "success": True,
-                "data": {
-                    "cards": warm_cards,
-                    "count": len(warm_cards),
-                    "session_id": session_id if session_id else None,
-                    "warm": True,
-                }
-            })
-
         attributes_source = data.get('attributes', data)
         attributes = _normalize_attributes(attributes_source)
         if session_id:
@@ -658,6 +611,7 @@ def generate_cards():
                 "cards": cards,
                 "count": len(cards),
                 "session_id": session_id if session_id else None,
+                "month": month,
             }
         })
     except OverloadedError as e:
@@ -679,6 +633,57 @@ def generate_cards():
     finally:
         if chat_session_lock is not None:
             chat_session_lock.release()
+
+
+@app.route('/api/v1/cards/cold', methods=['POST'])
+@limiter.limit(COLD_RATE_LIMIT)
+def get_cold_cards():
+    req_id = _request_id()
+    try:
+        data = _parse_request_json()
+        count = _normalize_count(data.get('count', COLD_BATCH_SIZE), COLD_BATCH_SIZE)
+        session_id = str(data.get("session_id", "")).strip()
+
+        batch = cold_pool.take()
+        cold_pool.schedule_refill()
+
+        if batch is None:
+            logger.info("[req:%s] cold pool empty, generating month-agnostic batch on-demand", req_id)
+            try:
+                batch = run_generation_safe(
+                    DEFAULT_ATTRIBUTES.copy(),
+                    num_cards=count,
+                    active_statuses=None,
+                    status_values=None,
+                    chat_session=None,
+                    request_id=req_id,
+                    month=None,
+                )
+            except OverloadedError as e:
+                return jsonify({"success": False, "error": str(e)}), 503
+
+        served = batch[:count]
+        return jsonify({
+            "success": True,
+            "data": {
+                "cards": served,
+                "count": len(served),
+                "session_id": session_id if session_id else None,
+                "cold": True,
+                "month": None,
+            }
+        })
+    except TimeoutError as e:
+        return jsonify({"success": False, "error": str(e)}), 504
+    except CardGenerationError as e:
+        logger.warning("[req:%s] Cold-start card generation failed: %s", req_id, e, exc_info=True)
+        return jsonify({"success": False, "error": str(e)}), 502
+    except RuntimeError as e:
+        logger.warning("[req:%s] Upstream rate limit: %s", req_id, e, exc_info=True)
+        return jsonify({"success": False, "error": "Upstream rate limit. Try later."}), 503
+    except Exception as e:
+        logger.exception("[req:%s] Error in /api/v1/cards/cold", req_id)
+        return jsonify({"success": False, "error": str(e)}), 500
 
 
 @app.route('/api/v1/cards/random', methods=['GET'])
@@ -726,6 +731,7 @@ def get_random_card():
                 "cards": cards,
                 "count": len(cards),
                 "session_id": session_id if session_id else None,
+                "month": month,
             }
         })
     except OverloadedError as e:
@@ -759,19 +765,6 @@ def get_batch_cards():
         data = _parse_request_json()
         count = _normalize_count(data.get('count', 3), 3)
         session_id = str(data.get("session_id", "")).strip()
-
-        warm_cards = _try_serve_warm_batch(session_id or None, count, req_id)
-        if warm_cards is not None:
-            return jsonify({
-                "success": True,
-                "data": {
-                    "cards": warm_cards,
-                    "count": len(warm_cards),
-                    "requested": count,
-                    "session_id": session_id if session_id else None,
-                    "warm": True,
-                }
-            })
 
         attributes_source = data.get('attributes', data)
         attributes = _normalize_attributes(attributes_source)
@@ -807,6 +800,7 @@ def get_batch_cards():
                 "count": len(cards),
                 "requested": count,
                 "session_id": session_id if session_id else None,
+                "month": month,
             }
         })
     except OverloadedError as e:
@@ -835,7 +829,7 @@ def get_stats():
     return jsonify({
         "generator": "active",
         "llm_provider": "deepseek",
-        "warm_pool": warm_pool.stats(),
+        "cold_pool": cold_pool.stats(),
     })
 
 
@@ -848,13 +842,13 @@ def ratelimit_handler(e):
     }), 429
 
 
-warm_pool.schedule_refill()
+cold_pool.schedule_refill()
 
 
 if __name__ == '__main__':
     print("Event Card Generator API Server")
     print("LLM: DeepSeek (deepseek-v4-flash)")
     print(f"DeepSeek thinking: {llm.thinking_type}")
-    print(f"Warm pool: target={WARM_POOL_SIZE} batch={WARM_BATCH_SIZE}")
+    print(f"Cold pool: target={COLD_POOL_SIZE} batch={COLD_BATCH_SIZE}")
     print("Ready to generate cards on-demand")
     app.run(host=ConfigClass.HOST, port=ConfigClass.PORT, debug=ConfigClass.DEBUG)

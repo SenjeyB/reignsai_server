@@ -195,25 +195,20 @@ class EventCardGenerator:
         self.situation_repair_attempts = max(1, int(os.getenv("SITUATION_REPAIR_ATTEMPTS", 1)))
         self.options_repair_attempts = max(1, int(os.getenv("OPTIONS_REPAIR_ATTEMPTS", 1)))
         self._global_session = self.gpt.create_session() if session_mode == "global" else None
-        self._local_focus_pool = [
-            "market stall licenses",
-            "bridge toll dispute",
-            "well maintenance duty",
-            "village watch staffing",
-            "road repair labor",
-            "grain storage spoilage",
-            "fishing rights conflict",
-            "mill queue scheduling",
-            "guild apprentice quota",
-            "harvest cart traffic",
-            "town gate closing hours",
-            "charcoal supply shortage",
-            "canal lock repairs",
-            "sheep grazing boundaries",
-            "bakery flour rationing",
-            "blacksmith coal allotment",
+        self._theme_pool = [
+            "petition", "accusation", "shortage", "discovery",
+            "delegation", "ceremony", "intrigue", "loyalty",
+            "inheritance", "tradition", "rumor", "rivalry",
+            "arrival", "celebration", "punishment", "reform",
         ]
-        self._recent_focuses: deque[str] = deque(maxlen=6)
+        self._domain_pool = [
+            "village", "court", "trade", "military",
+            "scholarly", "religious", "foreign", "personal",
+        ]
+        self._theme_bag: List[str] = []
+        self._domain_bag: List[str] = []
+        self._last_domain: str | None = None
+        self._bag_lock = threading.Lock()
         self._recent_situations: deque[str] = deque(maxlen=10)
         self._stopwords = {
             "about", "after", "again", "against", "along", "also", "among", "another", "because",
@@ -230,18 +225,28 @@ class EventCardGenerator:
             return self._global_session
         return self.gpt.create_session()
 
-    def _pick_focus(self, blocked_focuses: set[str] | None = None) -> str:
-        blocked = blocked_focuses or set()
-        candidates = [
-            focus
-            for focus in self._local_focus_pool
-            if focus not in blocked and focus not in self._recent_focuses
-        ]
-        if not candidates:
-            candidates = [focus for focus in self._local_focus_pool if focus not in blocked]
-        if not candidates:
-            candidates = self._local_focus_pool
-        return random.choice(candidates)
+    def _pick_theme_domain(self) -> tuple[str, str]:
+        with self._bag_lock:
+            if not self._theme_bag:
+                self._theme_bag = list(self._theme_pool)
+                random.shuffle(self._theme_bag)
+            if not self._domain_bag:
+                self._domain_bag = list(self._domain_pool)
+                random.shuffle(self._domain_bag)
+
+            theme = self._theme_bag.pop()
+
+            domain = None
+            if self._last_domain is not None and len(self._domain_bag) > 1:
+                for idx in range(len(self._domain_bag) - 1, -1, -1):
+                    if self._domain_bag[idx] != self._last_domain:
+                        domain = self._domain_bag.pop(idx)
+                        break
+            if domain is None:
+                domain = self._domain_bag.pop()
+            self._last_domain = domain
+
+            return theme, domain
 
     def _token_signature(self, text: str) -> set[str]:
         tokens = set(re.findall(r"[a-z]{4,}", text.lower()))
@@ -523,7 +528,8 @@ class EventCardGenerator:
         self,
         attributes: Dict[str, int],
         session: List[Dict[str, str]] | None = None,
-        focus_hint: str | None = None,
+        theme: str | None = None,
+        domain: str | None = None,
         active_statuses: List[str] | None = None,
         status_values: Dict[str, int] | None = None,
         month: str | None = None,
@@ -531,15 +537,17 @@ class EventCardGenerator:
         stats = self._stats_compact(attributes)
         statuses = self._status_context_compact(active_statuses, status_values)
         month_line = f"Month: {month}. Use the season subtly when it fits (harvest, frost, plague, festival).\n" if month else ""
+        theme_line = f"Theme: {theme}. Domain: {domain}.\n" if theme and domain else ""
 
         situation_prompt = (
-            f"Stats: {stats}. Statuses: {statuses}. Focus: {focus_hint or 'any local issue'}.\n"
+            f"Stats: {stats}. Statuses: {statuses}.\n"
+            f"{theme_line}"
             f"{month_line}"
             "Return exactly one JSON object with keys: situation, phrase.\n"
-            "situation: exactly 1 short sentence about a local medieval governance problem (village/market/road/mill/guild scale).\n"
-            "phrase: visitor complaint quote to the king, <=18 words, problem only.\n"
+            "situation: exactly 1 short sentence describing a medieval governance problem that fits the theme and domain.\n"
+            "phrase: petitioner's quote to the king, <=18 words, problem only.\n"
             "Do NOT include actions/options/alternatives in either field.\n"
-            "No markdown, no extra keys, no epic scale, no wars, no prophecy."
+            "No markdown, no extra keys, no fantasy (no magic, dragons, elves)."
         )
 
         situation_system_prompt = "Return strictly valid JSON only."
@@ -562,9 +570,9 @@ class EventCardGenerator:
             repair_system_prompt = "Return strictly valid JSON only. No markdown, no comments."
             repair_prompt = (
                 "Return exactly one JSON object with keys situation and phrase.\n"
-                "situation must be one concise sentence with local governance problem only.\n"
+                "situation must be one concise sentence describing a medieval governance problem matching the theme and domain.\n"
                 "phrase must be complaint quote <=18 words, no action proposals.\n"
-                f"Stats: {stats}\nStatuses: {statuses}\nFocus: {focus_hint or 'any local issue'}\n"
+                f"Stats: {stats}\nStatuses: {statuses}\n{theme_line.rstrip()}\n"
                 f"Source text:\n{response}"
             )
             last_error = parse_error
@@ -739,7 +747,6 @@ class EventCardGenerator:
         session: List[Dict[str, str]] | None = None,
         month: str | None = None,
     ) -> Dict[str, Any]:
-        used_focuses: set[str] = set()
         last_error: Exception | None = None
         attempt_errors: List[str] = []
         for attempt in range(max_retries):
@@ -751,13 +758,13 @@ class EventCardGenerator:
                     card_session = self._new_card_session()
                 else:
                     card_session = list(session)
-                focus = self._pick_focus(blocked_focuses=used_focuses)
-                used_focuses.add(focus)
+                theme, domain = self._pick_theme_domain()
 
                 situation, phrase = self.generate_situation(
                     attributes,
                     session=card_session,
-                    focus_hint=focus,
+                    theme=theme,
+                    domain=domain,
                     active_statuses=active_statuses,
                     status_values=status_values,
                     month=month,
@@ -785,7 +792,6 @@ class EventCardGenerator:
                     if session is not None and card_session is not None:
                         session.clear()
                         session.extend(card_session)
-                    self._recent_focuses.append(focus)
                     self._recent_situations.append(situation)
                     return card
                 last_error = ValueError(f"Validation failed: {message}")
