@@ -188,7 +188,7 @@ class EventCardGenerator:
 
     def __init__(self, llm_generator: DeepSeekLLMGenerator, verbose: bool = True, session_mode: str = "per-card"):
         self.gpt = llm_generator
-        self.max_delta_sum = 40
+        self.max_delta_sum = 50
         self.max_delta_per_stat = 20
         self.verbose = verbose
         self.session_mode = session_mode
@@ -265,6 +265,20 @@ class EventCardGenerator:
             if overlap >= 4 or jaccard >= 0.58:
                 return True
         return False
+
+    _MONTH_SEQUENCE = [
+        "January", "February", "March", "April", "May", "June",
+        "July", "August", "September", "October", "November", "December",
+    ]
+
+    def _advance_month(self, month: str | None, offset: int) -> str | None:
+        if not month:
+            return None
+        try:
+            idx = self._MONTH_SEQUENCE.index(month)
+        except ValueError:
+            return month
+        return self._MONTH_SEQUENCE[(idx + offset) % 12]
 
     def _compress_text(self, text: str, target_chars: int, kind: str) -> str:
         if not text or len(text) <= target_chars:
@@ -770,6 +784,240 @@ class EventCardGenerator:
 
         return option_1, option_2
 
+    def generate_situations_batch(
+        self,
+        attributes: Dict[str, int],
+        count: int,
+        theme_domain_list: List[tuple[str, str]],
+        month_list: List[str | None],
+        active_statuses: List[str] | None = None,
+        status_values: Dict[str, int] | None = None,
+    ) -> List[Dict[str, str]]:
+        stats = self._stats_compact(attributes)
+        statuses = self._status_context_compact(active_statuses, status_values)
+
+        any_month = any(m is not None for m in month_list)
+        intro = (
+            f"Generate {count} medieval governance situations."
+            + (
+                " Each card is set in a DIFFERENT month, chronologically advancing — the kingdom moves forward one month per card. The season MUST shape each situation (harvest, frost, planting, festival, plague risk, etc.)."
+                if any_month else ""
+            )
+        )
+
+        cards_block_lines = []
+        for i in range(count):
+            theme, domain = theme_domain_list[i]
+            month = month_list[i]
+            month_part = f"Month: {month}. " if month else ""
+            cards_block_lines.append(
+                f"Card {i + 1} — {month_part}Theme: {theme}. Domain: {domain}."
+            )
+        cards_block = "\n".join(cards_block_lines)
+
+        situation_prompt = (
+            f"Stats: {stats}. Statuses: {statuses}.\n"
+            f"{intro}\n\n"
+            f"{cards_block}\n\n"
+            'Return JSON:\n'
+            '{"cards":[\n'
+            '  {"situation":"<1 short sentence>", "phrase":"<petitioner quote, <=18 words>"},\n'
+            f'  ...x{count} in order\n'
+            ']}\n'
+            "Rules:\n"
+            "- situation: exactly 1 short sentence matching that card's theme, domain, and month/season.\n"
+            "- phrase: petitioner quote to the king, problem only, no action proposals.\n"
+            "- No fantasy (no magic/dragons/elves). No markdown. No extra keys.\n"
+            f"- Length of cards array MUST be {count}, in the same order as listed above."
+        )
+
+        response = self.gpt.generate(
+            "Return strictly valid JSON only.",
+            situation_prompt,
+            max_tokens=96 * count + 128,
+            temperature=0.4,
+            session=None,
+            response_format={"type": "json_object"},
+        )
+
+        def _parse(raw: str) -> List[Dict[str, str]]:
+            extracted = self._extract_first_json_object(raw) or raw
+            data = json.loads(extracted)
+            if not isinstance(data, dict) or "cards" not in data:
+                raise ValueError("missing 'cards' key")
+            arr = data["cards"]
+            if not isinstance(arr, list) or len(arr) != count:
+                raise ValueError(f"cards array length {len(arr) if isinstance(arr, list) else 'n/a'} != {count}")
+            result = []
+            for entry in arr:
+                if not isinstance(entry, dict):
+                    raise ValueError("card entry is not an object")
+                situation = entry.get("situation")
+                phrase = entry.get("phrase")
+                if not isinstance(situation, str) or not isinstance(phrase, str):
+                    raise ValueError("card missing situation/phrase strings")
+                result.append({"situation": situation.strip(), "phrase": phrase.strip()})
+            return result
+
+        try:
+            return _parse(response)
+        except Exception as parse_error:
+            logger.warning(
+                "Batch situations parse failed: %s; raw=%s",
+                parse_error,
+                (response or "")[:400].replace("\n", "\\n"),
+            )
+
+        repair_prompt = (
+            f"Return strict JSON with key 'cards' as an array of EXACTLY {count} objects, "
+            "each with 'situation' (1 short sentence) and 'phrase' (<=18 word petitioner quote).\n"
+            f"Themes/domains/months per card:\n{cards_block}\n"
+            "No markdown, no comments.\n"
+            f"Source text:\n{response}"
+        )
+        for _ in range(self.situation_repair_attempts):
+            repaired = self.gpt.generate(
+                "Return strictly valid JSON only. No markdown, no comments.",
+                repair_prompt,
+                max_tokens=96 * count + 128,
+                temperature=0.1,
+                session=None,
+                response_format={"type": "json_object"},
+            )
+            try:
+                return _parse(repaired)
+            except Exception as repair_error:
+                logger.warning(
+                    "Batch situations repair failed: %s; repaired=%s",
+                    repair_error,
+                    (repaired or "")[:400].replace("\n", "\\n"),
+                )
+        raise ValueError("Batch situations: parse failed after repair attempts")
+
+    def generate_options_batch(
+        self,
+        attributes: Dict[str, int],
+        situations: List[Dict[str, str]],
+        month_list: List[str | None],
+        active_statuses: List[str] | None = None,
+        status_values: Dict[str, int] | None = None,
+    ) -> List[Dict[str, Any]]:
+        stats = self._stats_compact(attributes)
+        statuses = self._status_context_compact(active_statuses, status_values)
+        count = len(situations)
+
+        rows = []
+        for i, item in enumerate(situations):
+            month = month_list[i] if i < len(month_list) else None
+            month_part = f"Month: {month}. " if month else ""
+            rows.append(
+                f"{i + 1}. {month_part}Situation: {item['situation']} Quote: {item['phrase']}"
+            )
+        rows_block = "\n".join(rows)
+
+        prompt = (
+            f"Stats: {stats}\nStatuses: {statuses}\n\n"
+            f"For each of these {count} situations (one per month), return 2 king's decisions.\n\n"
+            f"{rows_block}\n\n"
+            'Return JSON:\n'
+            '{"options":[\n'
+            '  {"option_1":{"description":"<=4 words","science":int,"army":int,"support":int,"resources":int},\n'
+            '   "option_2":{"description":"<=4 words","science":int,"army":int,"support":int,"resources":int}},\n'
+            f'  ...x{count} in order\n'
+            ']}\n'
+            f"Each stat delta integer in [-{self.max_delta_per_stat}, {self.max_delta_per_stat}]. "
+            f"Total |sum| across all four stats per option <= {self.max_delta_sum}.\n"
+            "Descriptions distinct within a pair. No markdown."
+        )
+
+        response = self.gpt.generate(
+            "Valid JSON only.",
+            prompt,
+            max_tokens=360 * count + 128,
+            temperature=0.2,
+            session=None,
+            response_format={"type": "json_object"},
+        )
+
+        def _parse(raw: str) -> List[Dict[str, Any]]:
+            extracted = self._extract_first_json_object(raw) or raw
+            data = json.loads(extracted)
+            if not isinstance(data, dict) or "options" not in data:
+                raise ValueError("missing 'options' key")
+            arr = data["options"]
+            if not isinstance(arr, list) or len(arr) != count:
+                raise ValueError(f"options array length {len(arr) if isinstance(arr, list) else 'n/a'} != {count}")
+            result = []
+            for entry in arr:
+                normalized = self._normalize_options_payload(entry)
+                opt1 = self._finalize_option(normalized.get("option_1"), 1)
+                opt2 = self._finalize_option(normalized.get("option_2"), 2)
+                if opt1["description"].strip().lower() == opt2["description"].strip().lower():
+                    raise ValueError("option descriptions are identical")
+                result.append({"option_1": opt1, "option_2": opt2})
+            return result
+
+        try:
+            return _parse(response)
+        except Exception as parse_error:
+            logger.warning(
+                "Batch options parse failed: %s; raw=%s",
+                parse_error,
+                (response or "")[:400].replace("\n", "\\n"),
+            )
+
+        repair_prompt = (
+            f"Return strict JSON with key 'options' as an array of EXACTLY {count} objects, "
+            "each with option_1 and option_2 (description + science/army/support/resources ints).\n"
+            f"Situations:\n{rows_block}\n"
+            f"Each stat delta in [-{self.max_delta_per_stat}, {self.max_delta_per_stat}], "
+            f"|sum| per option <= {self.max_delta_sum}.\n"
+            "No markdown, no comments.\n"
+            f"Source text:\n{response}"
+        )
+        for _ in range(self.options_repair_attempts):
+            repaired = self.gpt.generate(
+                "Return strictly valid JSON only. No markdown, no comments.",
+                repair_prompt,
+                max_tokens=360 * count + 128,
+                temperature=0.1,
+                session=None,
+                response_format={"type": "json_object"},
+            )
+            try:
+                return _parse(repaired)
+            except Exception as repair_error:
+                logger.warning(
+                    "Batch options repair failed: %s; repaired=%s",
+                    repair_error,
+                    (repaired or "")[:400].replace("\n", "\\n"),
+                )
+        raise ValueError("Batch options: parse failed after repair attempts")
+
+    def _finalize_option(self, option_data: Any, option_number: int) -> Dict[str, Any]:
+        if not isinstance(option_data, dict):
+            raise ValueError(f"option_{option_number} is not an object")
+        deltas = {
+            "science": int(option_data.get("science", 0)),
+            "army": int(option_data.get("army", 0)),
+            "support": int(option_data.get("support", 0)),
+            "resources": int(option_data.get("resources", 0)),
+        }
+        deltas = self._adjust_deltas(deltas)
+        description = str(option_data.get("description", "")).strip()[:200]
+        if not description:
+            description = f"Option {option_number}"
+        words = description.split()
+        if len(words) > 4:
+            description = " ".join(words[:4])
+        return {
+            "description": description,
+            "science": deltas["science"],
+            "army": deltas["army"],
+            "support": deltas["support"],
+            "resources": deltas["resources"],
+        }
+
     def generate_card(
         self,
         attributes: Dict[str, int],
@@ -876,19 +1124,84 @@ class EventCardGenerator:
         if self.verbose:
             print(f"Generating {num_cards} card(s)...", end="", flush=True)
 
-        cards = []
-        for i in range(num_cards):
-            card = self.generate_card(
+        theme_domain = [self._pick_theme_domain() for _ in range(num_cards)]
+        months = [self._advance_month(month, i) for i in range(num_cards)]
+
+        try:
+            situations = self.generate_situations_batch(
                 attributes,
-                max_retries=max_retries,
+                num_cards,
+                theme_domain,
+                months,
                 active_statuses=active_statuses,
                 status_values=status_values,
-                session=session,
-                month=month,
             )
+            options = self.generate_options_batch(
+                attributes,
+                situations,
+                months,
+                active_statuses=active_statuses,
+                status_values=status_values,
+            )
+        except Exception as e:
+            logger.warning("Batched generation failed: %s; falling back to per-card", e)
+            cards = []
+            for i in range(num_cards):
+                card = self.generate_card(
+                    attributes,
+                    max_retries=max_retries,
+                    active_statuses=active_statuses,
+                    status_values=status_values,
+                    session=None,
+                    month=months[i],
+                )
+                card["month"] = months[i]
+                cards.append(card)
+            if self.verbose:
+                print(" Done (fallback)")
+            return cards
+
+        cards = []
+        for i in range(num_cards):
+            situation_text = situations[i]["situation"]
+            if len(situation_text) > 140:
+                situation_text = self._compress_text(situation_text, 130, "situation")
+            situation_text = self._truncate_at_sentence(situation_text, max_length=180)
+
+            phrase_text = situations[i]["phrase"]
+            phrase_words = phrase_text.split()
+            if len(phrase_words) > 18:
+                phrase_text = " ".join(phrase_words[:18])
+            if len(phrase_text) > 130:
+                phrase_text = self._compress_text(phrase_text, 120, "petitioner quote")
+            phrase_text = self._truncate_at_sentence(phrase_text, max_length=180)
+
+            card = {
+                "situation": situation_text,
+                "phrase": phrase_text,
+                "option_1": options[i]["option_1"],
+                "option_2": options[i]["option_2"],
+                "month": months[i],
+            }
+
+            valid, msg = self.validate_card(card)
+            if not valid:
+                logger.warning("Batch card %d invalid (%s); per-card fallback", i, msg)
+                fallback = self.generate_card(
+                    attributes,
+                    max_retries=max_retries,
+                    active_statuses=active_statuses,
+                    status_values=status_values,
+                    session=None,
+                    month=months[i],
+                )
+                fallback["month"] = months[i]
+                card = fallback
+
+            self._recent_situations.append(card["situation"])
             cards.append(card)
             if self.verbose:
-                print(f" {i+1}", end="", flush=True)
+                print(f" {i + 1}", end="", flush=True)
 
         if self.verbose:
             print(" Done")
