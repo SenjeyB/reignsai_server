@@ -309,6 +309,25 @@ class EventCardGenerator:
             logger.warning("Compress %s failed: %s", kind, e)
         return text
 
+    _MONTH_LEAK_PATTERN = re.compile(
+        r"^\s*(?:In|During|This|It is|It's|Come|By|On)?\s*"
+        r"(?:early|mid|late)?\s*"
+        r"(?:January|February|March|April|May|June|July|August|September|October|November|December|"
+        r"spring|summer|autumn|fall|winter)"
+        r"[,:;—\-\s]+",
+        flags=re.IGNORECASE,
+    )
+
+    def _strip_month_leak(self, text: str) -> str:
+        if not text:
+            return text
+        stripped = self._MONTH_LEAK_PATTERN.sub("", text, count=1).lstrip(",;:—- ").strip()
+        if not stripped:
+            return text
+        if stripped and stripped[0].islower():
+            stripped = stripped[0].upper() + stripped[1:]
+        return stripped
+
     def _truncate_at_sentence(self, text: str, max_length: int = 400) -> str:
         if len(text) <= max_length:
             return text
@@ -578,7 +597,7 @@ class EventCardGenerator:
     ) -> tuple[str, str]:
         stats = self._stats_compact(attributes)
         statuses = self._status_context_compact(active_statuses, status_values)
-        month_line = f"Month: {month}. Use the season subtly when it fits (harvest, frost, plague, festival).\n" if month else ""
+        month_line = f"Month: {month}. Reflect the season ONLY through concrete details (frost, harvest carts, planting, fast days). NEVER name the month or season in the text.\n" if month else ""
         theme_line = f"Theme: {theme}. Domain: {domain}.\n" if theme and domain else ""
 
         situation_prompt = (
@@ -589,6 +608,7 @@ class EventCardGenerator:
             "situation: exactly 1 short sentence describing a medieval governance problem that fits the theme and domain.\n"
             "phrase: petitioner's quote to the king, <=18 words, problem only.\n"
             "Do NOT include actions/options/alternatives in either field.\n"
+            "Do NOT mention the month or season by name (no 'In February', 'this April', 'spring', 'winter').\n"
             "No markdown, no extra keys, no fantasy (no magic, dragons, elves)."
         )
 
@@ -648,6 +668,7 @@ class EventCardGenerator:
         situation = self._first_n_sentences(raw_situation, 1)
         situation = re.split(r"(?i)\b(option\s*1|option\s*2|choice\s*1|choice\s*2)\b", situation, maxsplit=1)[0].strip()
         situation = re.split(r"(?i)\b(should we|choose between|the king must choose)\b", situation, maxsplit=1)[0].strip()
+        situation = self._strip_month_leak(situation)
         if len(situation) > 140:
             situation = self._compress_text(situation, 130, "situation")
         situation = self._truncate_at_sentence(situation, max_length=180)
@@ -661,6 +682,7 @@ class EventCardGenerator:
         words = raw_phrase.split()
         if len(words) > 18:
             raw_phrase = " ".join(words[:18])
+        raw_phrase = self._strip_month_leak(raw_phrase)
         if len(raw_phrase) > 130:
             raw_phrase = self._compress_text(raw_phrase, 120, "petitioner quote")
         phrase = self._truncate_at_sentence(raw_phrase, max_length=180)
@@ -827,6 +849,7 @@ class EventCardGenerator:
             "Rules:\n"
             "- situation: exactly 1 short sentence matching that card's theme, domain, and month/season.\n"
             "- phrase: petitioner quote to the king, problem only, no action proposals.\n"
+            "- NEVER name the month explicitly (no 'In February', 'this April', etc.). Show the season ONLY through concrete details (frost on the wells, swollen rivers, harvest carts, mid-Lent fast, summer campaign, etc.).\n"
             "- No fantasy (no magic/dragons/elves). No markdown. No extra keys.\n"
             f"- Length of cards array MUST be {count}, in the same order as listed above."
         )
@@ -1163,12 +1186,12 @@ class EventCardGenerator:
 
         cards = []
         for i in range(num_cards):
-            situation_text = situations[i]["situation"]
+            situation_text = self._strip_month_leak(situations[i]["situation"])
             if len(situation_text) > 140:
                 situation_text = self._compress_text(situation_text, 130, "situation")
             situation_text = self._truncate_at_sentence(situation_text, max_length=180)
 
-            phrase_text = situations[i]["phrase"]
+            phrase_text = self._strip_month_leak(situations[i]["phrase"])
             phrase_words = phrase_text.split()
             if len(phrase_words) > 18:
                 phrase_text = " ".join(phrase_words[:18])
