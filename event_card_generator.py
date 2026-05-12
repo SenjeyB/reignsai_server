@@ -814,18 +814,34 @@ class EventCardGenerator:
         month_list: List[str | None],
         active_statuses: List[str] | None = None,
         status_values: Dict[str, int] | None = None,
+        session: List[Dict[str, str]] | None = None,
     ) -> List[Dict[str, str]]:
         stats = self._stats_compact(attributes)
         statuses = self._status_context_compact(active_statuses, status_values)
 
         any_month = any(m is not None for m in month_list)
-        intro = (
-            f"Generate {count} medieval governance situations."
-            + (
-                " Each card is set in a DIFFERENT month, chronologically advancing — the kingdom moves forward one month per card. The season MUST shape each situation (harvest, frost, planting, festival, plague risk, etc.)."
-                if any_month else ""
+        if any_month:
+            intro = (
+                f"Generate {count} medieval governance situations. "
+                "Cards advance chronologically by one month each. "
+                "The provided month is OPTIONAL flavor — focus on governance, people, politics; "
+                "use seasonal hints only when they fit naturally and lightly. Don't force a seasonal event in every card."
             )
-        )
+            season_rule = (
+                "- The month is OPTIONAL flavor. NEVER name the month or season explicitly. "
+                "If a seasonal detail fits naturally (a frosted well, a market crowd, fast days), weave it in lightly; "
+                "otherwise leave the season out entirely and focus on the theme/domain."
+            )
+        else:
+            intro = (
+                f"Generate {count} medieval governance situations. "
+                "The timeframe is unspecified — do NOT reference seasons, weather, or time of year at all."
+            )
+            season_rule = (
+                "- Do NOT mention seasons, weather, or time of year (no 'spring', 'autumn harvest', 'Lent', 'frost', etc.). "
+                "Keep situations season-neutral and timeless."
+            )
+        continuity_hint = " Build on the ongoing reign's prior cards for narrative continuity when relevant." if session else ""
 
         cards_block_lines = []
         for i in range(count):
@@ -839,7 +855,7 @@ class EventCardGenerator:
 
         situation_prompt = (
             f"Stats: {stats}. Statuses: {statuses}.\n"
-            f"{intro}\n\n"
+            f"{intro}{continuity_hint}\n\n"
             f"{cards_block}\n\n"
             'Return JSON:\n'
             '{"cards":[\n'
@@ -847,9 +863,9 @@ class EventCardGenerator:
             f'  ...x{count} in order\n'
             ']}\n'
             "Rules:\n"
-            "- situation: exactly 1 short sentence matching that card's theme, domain, and month/season.\n"
+            "- situation: exactly 1 short sentence matching that card's theme and domain.\n"
             "- phrase: petitioner quote to the king, problem only, no action proposals.\n"
-            "- NEVER name the month explicitly (no 'In February', 'this April', etc.). Show the season ONLY through concrete details (frost on the wells, swollen rivers, harvest carts, mid-Lent fast, summer campaign, etc.).\n"
+            f"{season_rule}\n"
             "- No fantasy (no magic/dragons/elves). No markdown. No extra keys.\n"
             f"- Length of cards array MUST be {count}, in the same order as listed above."
         )
@@ -859,7 +875,7 @@ class EventCardGenerator:
             situation_prompt,
             max_tokens=96 * count + 128,
             temperature=0.4,
-            session=None,
+            session=session,
             response_format={"type": "json_object"},
         )
 
@@ -924,10 +940,12 @@ class EventCardGenerator:
         month_list: List[str | None],
         active_statuses: List[str] | None = None,
         status_values: Dict[str, int] | None = None,
+        session: List[Dict[str, str]] | None = None,
     ) -> List[Dict[str, Any]]:
         stats = self._stats_compact(attributes)
         statuses = self._status_context_compact(active_statuses, status_values)
         count = len(situations)
+        any_month = any(m is not None for m in month_list)
 
         rows = []
         for i, item in enumerate(situations):
@@ -938,9 +956,15 @@ class EventCardGenerator:
             )
         rows_block = "\n".join(rows)
 
+        intro = (
+            f"For each of these {count} situations (one per month, advancing chronologically), return 2 king's decisions."
+            if any_month else
+            f"For each of these {count} situations, return 2 king's decisions."
+        )
+
         prompt = (
             f"Stats: {stats}\nStatuses: {statuses}\n\n"
-            f"For each of these {count} situations (one per month), return 2 king's decisions.\n\n"
+            f"{intro}\n\n"
             f"{rows_block}\n\n"
             'Return JSON:\n'
             '{"options":[\n'
@@ -958,7 +982,7 @@ class EventCardGenerator:
             prompt,
             max_tokens=360 * count + 128,
             temperature=0.2,
-            session=None,
+            session=session,
             response_format={"type": "json_object"},
         )
 
@@ -1158,6 +1182,7 @@ class EventCardGenerator:
                 months,
                 active_statuses=active_statuses,
                 status_values=status_values,
+                session=session,
             )
             options = self.generate_options_batch(
                 attributes,
@@ -1165,6 +1190,7 @@ class EventCardGenerator:
                 months,
                 active_statuses=active_statuses,
                 status_values=status_values,
+                session=session,
             )
         except Exception as e:
             logger.warning("Batched generation failed: %s; falling back to per-card", e)
