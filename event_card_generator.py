@@ -266,6 +266,35 @@ class EventCardGenerator:
                 return True
         return False
 
+    def _compress_text(self, text: str, target_chars: int, kind: str) -> str:
+        if not text or len(text) <= target_chars:
+            return text
+        prompt = (
+            f"Rewrite the following medieval {kind} in {target_chars} characters or fewer. "
+            "Keep the core meaning. Return strictly JSON: {\"text\": \"<rewritten>\"}.\n"
+            f"Source:\n{text}"
+        )
+        try:
+            response = self.gpt.generate(
+                "Return strictly valid JSON only. No markdown.",
+                prompt,
+                max_tokens=140,
+                temperature=0.2,
+                session=None,
+                response_format={"type": "json_object"},
+            )
+            extracted = self._extract_first_json_object(response) or response
+            parsed = json.loads(extracted)
+            if isinstance(parsed, dict):
+                rewritten = parsed.get("text") or parsed.get(kind) or parsed.get("situation") or parsed.get("phrase")
+                if isinstance(rewritten, str):
+                    rewritten = self._compact_line(rewritten).strip().strip('"').strip("'")
+                    if rewritten and len(rewritten) < len(text):
+                        return rewritten
+        except Exception as e:
+            logger.warning("Compress %s failed: %s", kind, e)
+        return text
+
     def _truncate_at_sentence(self, text: str, max_length: int = 400) -> str:
         if len(text) <= max_length:
             return text
@@ -277,11 +306,10 @@ class EventCardGenerator:
 
         if sentence_ends:
             return text[:sentence_ends[-1]].strip()
-        else:
-            last_space = truncated.rfind(' ')
-            if last_space > 0:
-                return text[:last_space].strip() + '...'
-            return truncated.strip() + '...'
+        last_space = truncated.rfind(' ')
+        if last_space > 0:
+            return text[:last_space].strip()
+        return truncated.strip()
 
     def _stats_compact(self, attributes: Dict[str, int]) -> str:
         if not isinstance(attributes, dict):
@@ -606,7 +634,9 @@ class EventCardGenerator:
         situation = self._first_n_sentences(raw_situation, 1)
         situation = re.split(r"(?i)\b(option\s*1|option\s*2|choice\s*1|choice\s*2)\b", situation, maxsplit=1)[0].strip()
         situation = re.split(r"(?i)\b(should we|choose between|the king must choose)\b", situation, maxsplit=1)[0].strip()
-        situation = self._truncate_at_sentence(situation, max_length=120)
+        if len(situation) > 140:
+            situation = self._compress_text(situation, 130, "situation")
+        situation = self._truncate_at_sentence(situation, max_length=180)
 
         raw_phrase = self._compact_line(situation_data.get("phrase", "")).strip('"').strip("'")
         raw_phrase = re.split(
@@ -617,7 +647,9 @@ class EventCardGenerator:
         words = raw_phrase.split()
         if len(words) > 18:
             raw_phrase = " ".join(words[:18])
-        phrase = self._truncate_at_sentence(raw_phrase, max_length=150)
+        if len(raw_phrase) > 130:
+            raw_phrase = self._compress_text(raw_phrase, 120, "petitioner quote")
+        phrase = self._truncate_at_sentence(raw_phrase, max_length=180)
 
         if not situation:
             situation = "A visitor comes to the king with an important matter."
